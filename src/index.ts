@@ -1063,6 +1063,16 @@ async function searchPatents(token: string, args: Record<string, unknown>) {
     // already in this response. No candidate next step is reliable across an
     // arbitrary top hit, so this stays without a `next` hint — a wrong hint
     // that fires on a meaningful share of real queries is worse than none.
+    //
+    // 14d re-measure (fleet #2325, 2026-10-07): no hint ever shipped here
+    // (reverted same-day, above), so this is a CONTROL, not a test of the
+    // next-hints mechanism. Single-tool-only callers of search_patents
+    // (bare + the gateway's disambiguated `epo_ops_search_patents` name,
+    // same tool, counted together): 171 -> 169 (total callers 238 -> 240),
+    // share 71.8% -> 70.4% — essentially flat. Useful as a sanity check that
+    // the re-measure methodology itself isn't noisy: the one tool with zero
+    // mechanism change showed near-zero movement. Full comparison in the
+    // fleet #2325 close.
   };
 }
 
