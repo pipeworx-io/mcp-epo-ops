@@ -765,6 +765,18 @@ const tools: McpToolExport['tools'] = [
       required: ['number'],
     },
   },
+  {
+    name: 'get_legal_status',
+    description:
+      'INPADOC legal status for a patent family, sourced from the EPO\'s worldwide legal-status database — grant, lapse, opposition, withdrawal, appeal and renewal-fee events as reported by the national/regional offices that know about this filing. Answers "is this patent still in force" and "did it lapse for non-payment of a renewal fee", which get_biblio, get_family and get_claims cannot. A European patent can stay in force in some contracting states while lapsing in others, so events are grouped per publication/country rather than collapsed into one in-force flag — read each member\'s events to see which jurisdiction a given event applies to. Each event carries an `influence` of "negative" (lapse, withdrawal, refusal, revocation), "positive" (grant, renewal, fee paid) or "neutral" (procedural/informational). Give the publication number as printed on the document; a trailing kind code is handled for you. Requires _apiKey=consumer_key:consumer_secret.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        number: { type: 'string', description: NUMBER_ARG_DESCRIPTION },
+      },
+      required: ['number'],
+    },
+  },
 ];
 
 interface CachedToken {
@@ -844,6 +856,37 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         claim_count: claims.length,
         claims,
         ...(claims.length === 0 ? { note: 'EPO returned a full-text record with no claim elements in it.', raw: r.data } : {}),
+      };
+    }
+    case 'get_legal_status': {
+      const r = await fetchByNumber(token, reqStr(args, 'number', '"EP1234567"'), (n) =>
+        `/legal/publication/epodoc/${n}`);
+      if (!r.found) {
+        return notIndexed(
+          r,
+          'Legal status (lapse, grant, opposition and renewal-fee events)',
+          'EPO\'s legal-status collection depends on national offices reporting events to the EPO, which can lag the publication itself. Call get_biblio for this number\'s title, applicants and classifications, or get_family to find another member of the same family that may carry legal status.',
+        );
+      }
+      const members = flattenLegalMembers(r.data);
+      const allEvents = members.flatMap((m) => m.events);
+      return {
+        found: true,
+        ...numberEcho(r),
+        family_id: members.find((m) => m.family_id)?.family_id ?? null,
+        total_events: allEvents.length,
+        // A European patent can be in force in some contracting states and
+        // lapsed in others at the same time, so this counts negative-influence
+        // events rather than collapsing to one in-force boolean that would be
+        // wrong for whichever state the caller actually cares about.
+        negative_event_count: allEvents.filter((e) => e.influence === 'negative').length,
+        countries_covered: [...new Set(members.map((m) => m.country).filter((c): c is string => !!c))],
+        // Members, each carrying their own events ordered oldest-first (OPS's
+        // own order) — read a member's LAST event for its most recent status.
+        members,
+        ...(allEvents.length === 0
+          ? { note: 'EPO returned family data for this publication but no legal-status events are recorded against it yet.' }
+          : {}),
       };
     }
     default:
@@ -1251,6 +1294,87 @@ function flattenExchangeDoc(doc: Record<string, unknown>) {
   };
 }
 
+// ── Legal status helpers ─────────────────────────────────────────────
+//
+// OPS's legal-status response is a patent-family document (`ops:patent-family
+// legal="true"`) with one `ops:family-member` per jurisdiction that has
+// published something about this invention, and each member carries its own
+// list of `ops:legal` events. The country-specific sub-fields OPS nests under
+// each event (`ops:L007EP`, `ops:L501EP`, …) are keyed per ISSUING OFFICE —
+// "EP" fields differ from "US" or "CN" fields — so rather than hardcode one
+// office's field names, the event's date and detail are read out of its
+// `ops:pre` line, which OPS renders the same way regardless of office.
+
+/** docdb-format document-id (country + doc-number + kind + date) under a reference block. */
+function docdbId(ref: unknown): Record<string, unknown> | null {
+  const ids = asArray(deepFind(ref, 'document-id'));
+  const match = ids.find((d) => asRecord(d)?.['@document-id-type'] === 'docdb');
+  return match ? asRecord(match) : null;
+}
+
+function isoDate(yyyymmdd: string): string | null {
+  return /^\d{8}$/.test(yyyymmdd) ? `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}` : null;
+}
+
+interface LegalEventRow {
+  code: string;
+  description: string;
+  influence: 'positive' | 'negative' | 'neutral';
+  date: string | null;
+  detail: string | null;
+}
+
+function flattenLegalEvent(ev: unknown): LegalEventRow {
+  const rec = asRecord(ev) ?? {};
+  const code = String(rec['@code'] ?? '').trim();
+  const description = String(rec['@desc'] ?? '').trim();
+  const influenceRaw = String(rec['@infl'] ?? '').trim();
+  const influence = influenceRaw === '+' ? 'positive' : influenceRaw === '-' ? 'negative' : 'neutral';
+  // The first `ops:pre` line is OPS's own rendered gazette line for this event
+  // — it carries the event's effective/gazette date and any office-specific
+  // detail (e.g. which contracting state a "lapsed" event applies to) as
+  // plain text, in a shape that is consistent across issuing offices.
+  const preLines = asArray(rec['ops:pre']).map(textOf).filter(Boolean);
+  const detail = preLines[0] ?? null;
+  const dateMatch = detail ? detail.match(/\d{4}-\d{2}-\d{2}/) : null;
+  return { code, description, influence, date: dateMatch ? dateMatch[0] : null, detail };
+}
+
+interface LegalMemberRow {
+  publication_number: string | null;
+  country: string | null;
+  kind: string | null;
+  publication_date: string | null;
+  family_id: string | null;
+  event_count: number;
+  events: LegalEventRow[];
+}
+
+function flattenLegalMember(member: unknown): LegalMemberRow {
+  const rec = asRecord(member) ?? {};
+  const pubRef = rec['publication-reference'];
+  const docdb = pubRef ? docdbId(pubRef) : null;
+  const country = docdb && typeof docdb.country !== 'undefined' ? textOf(docdb.country) || null : null;
+  const docNumber = docdb && typeof docdb['doc-number'] !== 'undefined' ? textOf(docdb['doc-number']) || null : null;
+  const kind = docdb && typeof docdb.kind !== 'undefined' ? textOf(docdb.kind) || null : null;
+  const rawDate = docdb && typeof docdb.date !== 'undefined' ? textOf(docdb.date) : '';
+  const events = asArray(rec['ops:legal']).map(flattenLegalEvent);
+  return {
+    publication_number: country && docNumber ? `${country}${docNumber}${kind ?? ''}` : null,
+    country,
+    kind,
+    publication_date: isoDate(rawDate),
+    family_id: rec['@family-id'] != null ? String(rec['@family-id']) : null,
+    event_count: events.length,
+    events,
+  };
+}
+
+/** Every `ops:family-member` in a legal-status response, flattened. */
+function flattenLegalMembers(data: unknown): LegalMemberRow[] {
+  return deepFindAll(data, 'ops:family-member').map(flattenLegalMember);
+}
+
 function extractClaims(data: unknown): string[] {
   const claimsNode = deepFind(data, 'claims');
   if (claimsNode == null) return [];
@@ -1341,4 +1465,14 @@ export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExpor
 // Exported for tests. The gateway consumes the default export only; these are
 // the pure response-shaping functions, which are the part worth pinning against
 // a real EPO payload.
-export { collectExchangeDocs, flattenExchangeDoc, extractClaims, compactIpc, textOf, deepFind };
+export {
+  collectExchangeDocs,
+  flattenExchangeDoc,
+  extractClaims,
+  compactIpc,
+  textOf,
+  deepFind,
+  flattenLegalMembers,
+  flattenLegalMember,
+  flattenLegalEvent,
+};

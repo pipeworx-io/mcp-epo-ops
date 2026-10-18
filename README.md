@@ -2,7 +2,7 @@
 
 European Patent Office Open Patent Services MCP — published patents from the EPO worldwide patent register (DocDB). Covers Europe and, via INPADOC family data, related filings across many jurisdictions worldwide. For US-only filings use the [`patents`](../patents/README.md) pack (USPTO ODP) instead — it doesn't overlap with this one on claims/citation coverage: this pack has `get_claims`, that one doesn't.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1715+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -11,6 +11,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `get_family(number)` — INPADOC family (related applications worldwide)
 - `get_abstract(number)` — abstract text
 - `get_claims(number)` — claims text
+- `get_legal_status(number)` — INPADOC legal status: grant, lapse, opposition, withdrawal, appeal and renewal-fee events, grouped per family member/contracting state
 
 ## Auth
 
@@ -69,7 +70,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1715+ data sources. The
+Both URLs reach the same gateway and the same 1831+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
