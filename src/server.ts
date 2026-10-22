@@ -10,7 +10,7 @@ import pack from './index.js';
 
 
 const server = new Server(
-  { name: '@pipeworx/mcp-epo-ops', version: '0.1.6' },
+  { name: '@pipeworx/mcp-epo-ops', version: '0.1.7' },
   { capabilities: { tools: {} } },
 );
 

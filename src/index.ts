@@ -670,6 +670,254 @@ function pickMessage(node: unknown, depth: number): string | null {
 function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
+
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
 /**
  * EPO Open Patent Services MCP
  *
@@ -695,13 +943,16 @@ const API_URL = 'https://ops.epo.org/3.2/rest-services';
 const EPO_TIMEOUT_MS = 25_000;
 
 const NUMBER_ARG_DESCRIPTION =
-  'Publication number as printed on the document, e.g. "EP1234567", "CN117928705A", "US10000000". Spaces, commas and slashes are ignored, and a trailing kind code (the "A" / "A1" / "B1" suffix) is retried without it if the exact form is not indexed.';
+  'Publication number as printed on the document, e.g. "EP1234567", "CN117928705A", "US10000000", or a PCT international publication like "WO2025028566" / "WO 2025/028566" / "WO2025028566A1". Spaces, commas and slashes are ignored, and a trailing kind code (the "A" / "A1" / "B1" suffix) is retried without it if the exact form is not indexed.';
+
+const FAMILY_NUMBER_ARG_DESCRIPTION =
+  `${NUMBER_ARG_DESCRIPTION} A WIPO-style PCT application number is also accepted before it has published, e.g. "PCT/US2024/012345" — this is resolved to the receiving office's application record and the family it belongs to; if that application number is not yet indexed, the response says so and names the number it tried.`;
 
 const tools: McpToolExport['tools'] = [
   {
     name: 'search_patents',
     description:
-      'Search published patents worldwide via EPO OPS and get back full bibliographic records — title, applicants, inventors, publication date, country, IPC classifications — for each hit. Searches EPO DOCDB, which indexes publications from 100+ patent offices, so Chinese, Japanese, Korean and US documents are all in scope alongside European ones. Each hit\'s `kind` code tells you what stage it is: an "A"-prefixed kind (A1, A2, A3…) is a published APPLICATION, not yet granted; a "B"-prefixed kind (B1, B2…) is a GRANTED patent. Results are not filtered to grants by default — most hits from a bare keyword search will be "A" kind. To find issued/granted patents specifically, scope the query with a kind or grant-relevant field (e.g. add `AND pd>=<date>` and check `kind` on the returned rows) rather than assuming an unfiltered hit is granted. Example queries: "ta=hydrogen", "in=Tesla", "pa=apple", "txt=neural network AND pd>=2020".',
+      'Search published patents worldwide via EPO OPS and get back full bibliographic records — title, applicants, inventors, publication date, country, IPC classifications — for each hit. Searches EPO DOCDB, which indexes publications from 100+ patent offices, so Chinese, Japanese, Korean, US and PCT/WO documents are all in scope alongside European ones — PCT international applications (publications beginning "WO") are covered here and in every other tool in this pack, not just EP filings. Each hit\'s `kind` code tells you what stage it is: an "A"-prefixed kind (A1, A2, A3…) is a published APPLICATION, not yet granted; a "B"-prefixed kind (B1, B2…) is a GRANTED patent; a WO publication\'s "A1"/"A2"/"A3" marks the PCT publication itself, not a grant — PCT applications are examined and granted nationally after entering each country\'s national phase, which this pack does not track. Results are not filtered to grants by default — most hits from a bare keyword search will be "A" kind. To find issued/granted patents specifically, scope the query with a kind or grant-relevant field (e.g. add `AND pd>=<date>` and check `kind` on the returned rows) rather than assuming an unfiltered hit is granted. Example queries: "ta=hydrogen", "in=Tesla", "pa=apple", "txt=neural network AND pd>=2020", "pa=moderna and pn=WO" (a company\'s PCT filings).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -720,7 +971,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_biblio',
     description:
-      'Bibliographic data for one published patent — title, inventors, applicants, publication date, IPC classifications. Drawn from EPO DOCDB, which covers 100+ patent offices, so Chinese, Japanese, Korean and US publications resolve as well as European ones. Give the publication number as printed on the document; a trailing kind code such as the "A" in "CN117928705A" is handled for you.',
+      'Bibliographic data for one published patent — title, inventors, applicants, publication date, IPC classifications. Drawn from EPO DOCDB, which covers 100+ patent offices, so Chinese, Japanese, Korean, US and PCT/WO publications resolve as well as European ones. A PCT international application (a "WO" publication number) is answered the same as any other — this is NOT the International Search Report or Written Opinion, which EPO OPS does not carry at all; for those, go to WIPO PATENTSCOPE (patentscope.wipo.int). Give the publication number as printed on the document; a trailing kind code such as the "A" in "CN117928705A" is handled for you.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -732,11 +983,15 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'get_family',
     description:
-      'INPADOC family — every related patent publication worldwide covering the same underlying invention, which is how you find the Chinese, Japanese, US and European members of one filing. Give the publication number as printed on the document; a trailing kind code is handled for you.',
+      'INPADOC family — every related patent publication worldwide covering the same underlying invention, which is how you find the Chinese, Japanese, US, European and PCT/WO members of one filing. Returns a member count and the countries covered first, then one row per family member: publication number (with kind and date), application number, and priority claims. A PCT international application is a normal member here — give its "WO" publication number, or (before it has published) a WIPO application number like "PCT/US2024/012345". This does NOT include the International Search Report or Written Opinion of a PCT application — EPO OPS does not carry that document at all; for it, go to WIPO PATENTSCOPE (patentscope.wipo.int). Give the publication number as printed on the document; a trailing kind code is handled for you.',
     inputSchema: {
       type: 'object',
       properties: {
-        number: { type: 'string', description: NUMBER_ARG_DESCRIPTION },
+        number: { type: 'string', description: FAMILY_NUMBER_ARG_DESCRIPTION },
+        raw: {
+          type: 'boolean',
+          description: 'Include the raw OPS XML-as-JSON family payload alongside the normalised member list. Off by default — the normalised list has everything most callers need.',
+        },
       },
       required: ['number'],
     },
@@ -820,10 +1075,43 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       };
     }
     case 'get_family': {
-      const r = await fetchByNumber(token, reqStr(args, 'number', '"EP1234567"'), (n) =>
-        `/family/publication/epodoc/${n}`);
-      if (!r.found) return notIndexed(r, 'INPADOC family data');
-      return { found: true, ...numberEcho(r), family: r.data };
+      const rawNumber = reqStr(args, 'number', '"WO2025028566" or "EP1234567"');
+      const pct = parsePctApplicationNumber(rawNumber);
+      let r: NumberFetch;
+      if (pct) {
+        // Not yet published as a WO number (or the caller only has the
+        // application number) — resolve via the application-reference route
+        // instead of the publication one. Verified live 2026-10-18:
+        // "JP2024027365W" (from "PCT/JP2024/027365") is the epodoc form OPS
+        // indexes for WO2025028566's underlying PCT application.
+        r = await fetchByNumber(token, pct.epodoc, (n) => `/family/application/epodoc/${n}`);
+        r = { ...r, requested: rawNumber, tried: [pct.epodoc, ...r.tried.filter((t) => t !== pct.epodoc)] };
+      } else {
+        r = await fetchByNumber(token, rawNumber, (n) => `/family/publication/epodoc/${n}`);
+      }
+      if (!r.found) {
+        return notIndexed(
+          r,
+          'INPADOC family data',
+          pct
+            ? `"${rawNumber}" was read as the PCT application number and looked up as "${pct.epodoc}" — that application is not indexed as a family in this collection yet. Check the number, or search for it once it has published with a "WO" number (search_patents with ap="${pct.year}${pct.serial}").`
+            : undefined,
+        );
+      }
+      const members = flattenFamilyMembers(r.data);
+      const countries = [...new Set(members.map((m) => m.country).filter((c): c is string => !!c))];
+      return {
+        found: true,
+        ...numberEcho(r),
+        ...(pct ? { matched_as: 'pct_application_number', resolved_application_number: pct.epodoc } : {}),
+        member_count: members.length,
+        countries,
+        members,
+        ...(args.raw === true ? { raw: r.data } : {}),
+        ...(members.length === 0
+          ? { note: 'EPO returned family data with no family-member elements in it.', raw: r.data }
+          : {}),
+      };
     }
     case 'get_abstract': {
       const r = await fetchByNumber(token, reqStr(args, 'number', '"EP1234567"'), (n) =>
@@ -1294,6 +1582,101 @@ function flattenExchangeDoc(doc: Record<string, unknown>) {
   };
 }
 
+// ── Family helpers ────────────────────────────────────────────────────
+//
+// get_family used to hand back the raw `ops:patent-family` tree — nested
+// `@attributes`, an `ops:family-member` that is a bare object for a
+// single-member family and an array for every other one — which is exactly
+// the "looks fine, nobody can read it" shape this pack's other tools were
+// already normalising. These mirror that treatment: one flat row per member,
+// with the same field names (`publication_number`, `country`, `kind`,
+// `publication_date`) get_biblio uses, plus the application number and
+// priority claims a family member also carries.
+
+/** docdb-format document-id (country + doc-number + kind + date) under a reference block. */
+function docdbId(ref: unknown): Record<string, unknown> | null {
+  const ids = asArray(deepFind(ref, 'document-id'));
+  const match = ids.find((d) => asRecord(d)?.['@document-id-type'] === 'docdb');
+  return match ? asRecord(match) : null;
+}
+
+interface PriorityClaimRow {
+  number: string | null;
+  country: string | null;
+  kind: string | null;
+  date: string | null;
+}
+
+function flattenPriorityClaim(claim: unknown): PriorityClaimRow {
+  const docdb = docdbId(claim);
+  const country = docdb ? textOf(docdb.country) || null : null;
+  const docNumber = docdb ? textOf(docdb['doc-number']) || null : null;
+  const kind = docdb ? textOf(docdb.kind) || null : null;
+  const rawDate = docdb ? textOf(docdb.date) : '';
+  return {
+    number: country && docNumber ? `${country}${docNumber}${kind ?? ''}` : null,
+    country,
+    kind,
+    date: isoDate(rawDate),
+  };
+}
+
+interface FamilyMemberRow {
+  publication_number: string | null;
+  country: string | null;
+  kind: string | null;
+  publication_date: string | null;
+  application_number: string | null;
+  family_id: string | null;
+  priority_claims: PriorityClaimRow[];
+}
+
+function flattenFamilyMember(member: unknown): FamilyMemberRow {
+  const rec = asRecord(member) ?? {};
+  const pubDocdb = docdbId(rec['publication-reference']);
+  const country = pubDocdb ? textOf(pubDocdb.country) || null : null;
+  const docNumber = pubDocdb ? textOf(pubDocdb['doc-number']) || null : null;
+  const kind = pubDocdb ? textOf(pubDocdb.kind) || null : null;
+  const rawDate = pubDocdb ? textOf(pubDocdb.date) : '';
+  const appDocdb = docdbId(rec['application-reference']);
+  const appCountry = appDocdb ? textOf(appDocdb.country) || null : null;
+  const appNumber = appDocdb ? textOf(appDocdb['doc-number']) || null : null;
+  return {
+    publication_number: country && docNumber ? `${country}${docNumber}${kind ?? ''}` : null,
+    country,
+    kind,
+    publication_date: isoDate(rawDate),
+    application_number: appCountry && appNumber ? `${appCountry}${appNumber}` : null,
+    family_id: rec['@family-id'] != null ? String(rec['@family-id']) : null,
+    // One member usually carries one priority claim, but a filing can claim
+    // several (e.g. a continuation claiming two earlier priorities), so this
+    // stays a list rather than collapsing to whichever came back first.
+    priority_claims: asArray(rec['priority-claim']).map(flattenPriorityClaim),
+  };
+}
+
+/** Every `ops:family-member` in a family response, flattened. */
+function flattenFamilyMembers(data: unknown): FamilyMemberRow[] {
+  return deepFindAll(data, 'ops:family-member').map(flattenFamilyMember);
+}
+
+/**
+ * A WIPO-style PCT application number, "PCT/CC/YYYY/NNNNNN" as printed before
+ * the filing has published with a WO number (e.g. "PCT/US2024/012345"). OPS
+ * indexes it under the receiving office's own application number in epodoc
+ * form — country + year + serial + "W" — verified live 2026-10-18:
+ * "PCT/JP2024/027365" -> "JP2024027365W" is WO2025028566's underlying filing.
+ */
+const PCT_APPLICATION_RE = /^PCT\s*\/?\s*([A-Za-z]{2})\s*(\d{4})\s*\/?\s*(\d{3,8})$/i;
+function parsePctApplicationNumber(raw: string): { country: string; year: string; serial: string; epodoc: string } | null {
+  const m = PCT_APPLICATION_RE.exec(raw.trim());
+  if (!m) return null;
+  const country = m[1].toUpperCase();
+  const year = m[2];
+  const serial = m[3];
+  return { country, year, serial, epodoc: `${country}${year}${serial}W` };
+}
+
 // ── Legal status helpers ─────────────────────────────────────────────
 //
 // OPS's legal-status response is a patent-family document (`ops:patent-family
@@ -1305,12 +1688,7 @@ function flattenExchangeDoc(doc: Record<string, unknown>) {
 // office's field names, the event's date and detail are read out of its
 // `ops:pre` line, which OPS renders the same way regardless of office.
 
-/** docdb-format document-id (country + doc-number + kind + date) under a reference block. */
-function docdbId(ref: unknown): Record<string, unknown> | null {
-  const ids = asArray(deepFind(ref, 'document-id'));
-  const match = ids.find((d) => asRecord(d)?.['@document-id-type'] === 'docdb');
-  return match ? asRecord(match) : null;
-}
+// docdbId is defined above, in the Family helpers section — shared by both.
 
 function isoDate(yyyymmdd: string): string | null {
   return /^\d{8}$/.test(yyyymmdd) ? `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}` : null;
@@ -1475,4 +1853,8 @@ export {
   flattenLegalMembers,
   flattenLegalMember,
   flattenLegalEvent,
+  flattenFamilyMembers,
+  flattenFamilyMember,
+  flattenPriorityClaim,
+  parsePctApplicationNumber,
 };

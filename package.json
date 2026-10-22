@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-epo-ops",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "EPO Open Patent Services MCP",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-98287cac6b9992fd2a821d67eebc027b32ab295ed35c079ad94a22473dd690f2",
-    "sourceCommit": "514e3efb42b8d81082c07e01d3ae7654bbf91f52"
+    "sourceHash": "v1-b9846006f0c7018e2154664e902eca8063bc8791699b6473a44b2bebfa680fc9",
+    "sourceCommit": "712a5e0171ea24483214329d0cd7efdfd9b80352"
   }
 }
