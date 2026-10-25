@@ -2,7 +2,7 @@
 
 European Patent Office Open Patent Services MCP — published patents from the EPO worldwide patent register (DocDB). Covers Europe and, via INPADOC family data, related filings across many jurisdictions worldwide — **including PCT international applications (publications beginning "WO")**: this is Pipeworx's PCT source (ruled 2026-10-18, no WIPO PCT webservice purchase). For US-only filings use the [`patents`](../patents/README.md) pack (USPTO ODP) instead — it doesn't overlap with this one on claims/citation coverage: this pack has `get_claims`, that one doesn't.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1866+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 This pack does **not** carry a PCT application's International Search Report (ISR) or Written Opinion — the EPO's worldwide data service doesn't hold that document at all. For the ISR/Written Opinion itself, go to WIPO PATENTSCOPE instead.
 
@@ -74,7 +74,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1866+ data sources. The
+Both URLs reach the same gateway and the same 1879+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
