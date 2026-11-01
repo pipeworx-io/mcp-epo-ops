@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-epo-ops",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "EPO Open Patent Services MCP",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "epo-ops",
     "gatewaySlug": "epo-ops",
-    "sourceHash": "v1-96fb3f3bfd5d6f24916258d2b323bd0f575b79d0383c3524897ef24204ab7a44",
-    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
+    "sourceHash": "v1-4cde161566ddbaf0b838684f3eb286b3afa5fad2a9ecb8021389c49167bedcfa",
+    "sourceCommit": "d35e32c1ffe988e24d391dedb35666387fd2b3d6"
   }
 }
